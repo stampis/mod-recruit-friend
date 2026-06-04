@@ -8,21 +8,22 @@
 #include "Player.h"
 #include "Config.h"
 #include "Chat.h"
-#include "AccountMgr.h"
+#include "CharacterDatabase.h"
 #include "LoginDatabase.h"
+#include "Log.h"
 #include <map>
 
-enum RecruitFriendTexts
+enum RecruitFriendTexts : uint32
 {
-    HELLO_RECRUIT_FRIEND                        = 35450,
-    RECRUIT_FRIEND_DISABLE                      = 35451,
-    RECRUIT_FRIEND_ALREADY_HAVE_RECRUITED       = 35452,
-    RECRUIT_FRIEND_SUCCESS                      = 35453,
-    RECRUIT_FRIEND_RESET_SUCCESS                = 35454,
-    RECRUIT_FRIEND_TARGET_ONESELF               = 35455,
-    RECRUIT_FRIEND_NAMES                        = 35456,
-    RECRUIT_FRIEND_COOLDOWN                     = 35457,
-    RECRUIT_VIEW_EMPTY                          = 35458
+    HELLO_RECRUIT_FRIEND                        = 1,
+    RECRUIT_FRIEND_DISABLE                      = 2,
+    RECRUIT_FRIEND_ALREADY_HAVE_RECRUITED       = 3,
+    RECRUIT_FRIEND_SUCCESS                      = 4,
+    RECRUIT_FRIEND_RESET_SUCCESS                = 5,
+    RECRUIT_FRIEND_TARGET_ONESELF               = 6,
+    RECRUIT_FRIEND_NAMES                        = 7,
+    RECRUIT_FRIEND_COOLDOWN                     = 8,
+    RECRUIT_VIEW_EMPTY                          = 9
 };
 
 struct RecruitFriendStruct
@@ -39,51 +40,52 @@ class RecruitFriendAnnouncer : public PlayerScript
 public:
     RecruitFriendAnnouncer() : PlayerScript("RecruitFriendAnnouncer") {}
 
-    void OnLogin(Player* player)
+    void OnPlayerLogin(Player* player) override
     {
         if (recruitFriend.announceEnable)
-        {
-            ChatHandler(player->GetSession()).SendSysMessage(HELLO_RECRUIT_FRIEND);
-        }
+            ChatHandler(player->GetSession()).PSendModuleSysMessage("mod-recruit-friend", HELLO_RECRUIT_FRIEND);
+    }
+
+    void OnPlayerLogout(Player* player) override
+    {
+        uint32 accountId = player->GetSession()->GetAccountId();
+        auto it = recruitFriend.commandCooldown.find(accountId);
+        if (it == recruitFriend.commandCooldown.end())
+            return;
+
+        uint32 delta = static_cast<uint32>(std::difftime(std::time(nullptr), it->second));
+        if (delta > recruitFriend.cooldownValue / IN_MILLISECONDS)
+            recruitFriend.commandCooldown.erase(it);
     }
 };
 
-void registerQuery(ChatHandler* handler, const char* commandType)
+// Returns true if the command is still on cooldown (message sent), false if the player can proceed.
+static bool isCommandOnCooldown(ChatHandler* handler, uint32 accountId)
 {
-    uint32 myAccountId = handler->GetSession()->GetAccountId();
+    auto it = recruitFriend.commandCooldown.find(accountId);
+    if (it == recruitFriend.commandCooldown.end())
+        return false;
 
-    std::string accountName;
+    std::time_t currentTime = std::time(nullptr);
+    uint32 delta = static_cast<uint32>(std::difftime(currentTime, it->second));
+    uint32 cooldownSeconds = recruitFriend.cooldownValue / IN_MILLISECONDS;
 
-    AccountMgr::GetName(myAccountId, accountName);
+    if (delta <= cooldownSeconds)
+    {
+        handler->PSendModuleSysMessage("mod-recruit-friend", RECRUIT_FRIEND_COOLDOWN, cooldownSeconds - delta);
+        return true;
+    }
 
-    std::string characterName = handler->GetSession()->GetPlayerName();
-
-    std::string ipAccount = handler->GetSession()->GetRemoteAddress();
-
-    QueryResult info = LoginDatabase.Query("INSERT INTO `recruit_info` (`accountId`, `accountName`, `characterName`, `ip`, `command`) VALUES ({}, '{}', '{}', '{}', '{}')", myAccountId, accountName.c_str(), characterName.c_str(), ipAccount.c_str(), commandType);
+    recruitFriend.commandCooldown.erase(it);
+    return false;
 }
 
-static void waitToUseCommand(ChatHandler* handler, uint32 myAccountId)
-{
-    std::time_t currentTime = std::time(0);
-
-    uint32 delta = std::difftime(currentTime, recruitFriend.commandCooldown[myAccountId]);
-
-    if (delta <= (uint32)recruitFriend.cooldownValue / 1000)
-    {
-        ChatHandler(handler->GetSession()).PSendSysMessage(RECRUIT_FRIEND_COOLDOWN, ((uint32)recruitFriend.cooldownValue / IN_MILLISECONDS) - delta);
-    }
-    else
-    {
-        recruitFriend.commandCooldown.erase(myAccountId);
-    }
-}
-
-static void getTargetAccountIdByName(std::string& name, uint32& accountId)
+static uint32 getTargetAccountIdByName(std::string const& name)
 {
     QueryResult result = CharacterDatabase.Query("SELECT `account` FROM `characters` WHERE `name`='{}'", name);
-
-    accountId = (*result)[0].Get<int32>();
+    if (!result)
+        return 0;
+    return (*result)[0].Get<uint32>();
 }
 
 using namespace Acore::ChatCommands;
@@ -112,10 +114,9 @@ class RecruitCommandscript : public CommandScript
 
         static bool HandleAddRecruitFriendCommand(ChatHandler* handler, std::string characterName)
         {
-
             if (!recruitFriend.commandEnable)
             {
-                handler->SendSysMessage(RECRUIT_FRIEND_DISABLE);
+                handler->PSendModuleSysMessage("mod-recruit-friend", RECRUIT_FRIEND_DISABLE);
                 return false;
             }
 
@@ -123,23 +124,16 @@ class RecruitCommandscript : public CommandScript
                 return false;
 
             Player* target = nullptr;
-
             std::string playerName;
-            uint32 targetAccountId;
+            uint32 targetAccountId = 0;
 
             if (!handler->extractPlayerTarget(characterName.data(), &target, nullptr, &playerName))
-            {
                 return false;
-            }
 
             if (target)
-            {
                 targetAccountId = target->GetSession()->GetAccountId();
-            }
             else
-            {
-                getTargetAccountIdByName(playerName, targetAccountId);
-            }
+                targetAccountId = getTargetAccountIdByName(playerName);
 
             if (targetAccountId == 0)
             {
@@ -150,34 +144,32 @@ class RecruitCommandscript : public CommandScript
 
             uint32 myAccountId = handler->GetSession()->GetAccountId();
 
+            if (targetAccountId == myAccountId)
+            {
+                handler->PSendModuleSysMessage("mod-recruit-friend", RECRUIT_FRIEND_TARGET_ONESELF);
+                return true;
+            }
+
             if (recruitFriend.cooldownEnabled)
             {
-                waitToUseCommand(handler, myAccountId);
-
-                if (!recruitFriend.commandCooldown[myAccountId])
-                    recruitFriend.commandCooldown[myAccountId] = std::time(0);
-                else
+                if (isCommandOnCooldown(handler, myAccountId))
                     return true;
+                recruitFriend.commandCooldown[myAccountId] = std::time(nullptr);
             }
 
-            registerQuery(handler, "add");
+            LOG_INFO("module.recruitfriend", "[RecruitFriend] Account: {} | Character: {} | IP: {} | Command: add | Target account: {}",
+                myAccountId, handler->GetSession()->GetPlayerName(), handler->GetSession()->GetRemoteAddress(), targetAccountId);
 
-            QueryResult result = LoginDatabase.Query("SELECT * FROM `account` WHERE `recruiter` <> 0 AND `id`={}", myAccountId);
+            QueryResult result = LoginDatabase.Query("SELECT 1 FROM `account` WHERE `recruiter` <> 0 AND `id`={}", myAccountId);
 
             if (result)
-            {
-                ChatHandler(handler->GetSession()).SendSysMessage(RECRUIT_FRIEND_ALREADY_HAVE_RECRUITED);
-            }
-            else if (targetAccountId != myAccountId)
-            {
-                result = LoginDatabase.Query("UPDATE `account` SET `recruiter`={} WHERE `id`={}", targetAccountId, myAccountId);
-
-                ChatHandler(handler->GetSession()).SendSysMessage(RECRUIT_FRIEND_SUCCESS);
-            }
+                handler->PSendModuleSysMessage("mod-recruit-friend", RECRUIT_FRIEND_ALREADY_HAVE_RECRUITED);
             else
             {
-                ChatHandler(handler->GetSession()).SendSysMessage(RECRUIT_FRIEND_TARGET_ONESELF);
+                LoginDatabase.Execute("UPDATE `account` SET `recruiter`={} WHERE `id`={}", targetAccountId, myAccountId);
+                handler->PSendModuleSysMessage("mod-recruit-friend", RECRUIT_FRIEND_SUCCESS);
             }
+
             return true;
         }
 
@@ -185,7 +177,7 @@ class RecruitCommandscript : public CommandScript
         {
             if (!recruitFriend.commandEnable)
             {
-                handler->SendSysMessage(RECRUIT_FRIEND_DISABLE);
+                handler->PSendModuleSysMessage("mod-recruit-friend", RECRUIT_FRIEND_DISABLE);
                 return false;
             }
 
@@ -193,19 +185,24 @@ class RecruitCommandscript : public CommandScript
 
             if (recruitFriend.cooldownEnabled)
             {
-                waitToUseCommand(handler, myAccountId);
-
-                if (!recruitFriend.commandCooldown[myAccountId])
-                    recruitFriend.commandCooldown[myAccountId] = std::time(0);
-                else
+                if (isCommandOnCooldown(handler, myAccountId))
                     return true;
+                recruitFriend.commandCooldown[myAccountId] = std::time(nullptr);
             }
 
-            registerQuery(handler, "reset");
+            LOG_INFO("module.recruitfriend", "[RecruitFriend] Account: {} | Character: {} | IP: {} | Command: reset",
+                myAccountId, handler->GetSession()->GetPlayerName(), handler->GetSession()->GetRemoteAddress());
 
-            QueryResult result = LoginDatabase.Query("UPDATE `account` SET `recruiter`=0 WHERE `id`={}", myAccountId);
+            QueryResult result = LoginDatabase.Query("SELECT `recruiter` FROM `account` WHERE `id`={}", myAccountId);
 
-            ChatHandler(handler->GetSession()).SendSysMessage(RECRUIT_FRIEND_RESET_SUCCESS);
+            if (!result || (*result)[0].Get<uint32>() == 0)
+            {
+                handler->PSendModuleSysMessage("mod-recruit-friend", RECRUIT_VIEW_EMPTY);
+                return true;
+            }
+
+            LoginDatabase.Execute("UPDATE `account` SET `recruiter`=0 WHERE `id`={}", myAccountId);
+            handler->PSendModuleSysMessage("mod-recruit-friend", RECRUIT_FRIEND_RESET_SUCCESS);
 
             return true;
         }
@@ -214,7 +211,7 @@ class RecruitCommandscript : public CommandScript
         {
             if (!recruitFriend.commandEnable)
             {
-                handler->SendSysMessage(RECRUIT_FRIEND_DISABLE);
+                handler->PSendModuleSysMessage("mod-recruit-friend", RECRUIT_FRIEND_DISABLE);
                 return false;
             }
 
@@ -222,30 +219,36 @@ class RecruitCommandscript : public CommandScript
 
             if (recruitFriend.cooldownEnabled)
             {
-                waitToUseCommand(handler, myAccountId);
-
-                if (!recruitFriend.commandCooldown[myAccountId])
-                    recruitFriend.commandCooldown[myAccountId] = std::time(0);
-                else
+                if (isCommandOnCooldown(handler, myAccountId))
                     return true;
+                recruitFriend.commandCooldown[myAccountId] = std::time(nullptr);
             }
 
-            registerQuery(handler, "view");
+            LOG_INFO("module.recruitfriend", "[RecruitFriend] Account: {} | Character: {} | IP: {} | Command: view",
+                myAccountId, handler->GetSession()->GetPlayerName(), handler->GetSession()->GetRemoteAddress());
 
             QueryResult result = LoginDatabase.Query("SELECT `recruiter` FROM `account` WHERE `id`={}", myAccountId);
 
             if (result)
             {
-                QueryResult resultCharacters = CharacterDatabase.Query("SELECT `name` FROM `characters` WHERE `account`={}", (*result)[0].Get<uint32>());
+                uint32 recruiterId = (*result)[0].Get<uint32>();
+
+                if (recruiterId == 0)
+                {
+                    handler->PSendModuleSysMessage("mod-recruit-friend", RECRUIT_VIEW_EMPTY);
+                    return true;
+                }
+
+                QueryResult resultCharacters = CharacterDatabase.Query("SELECT `name` FROM `characters` WHERE `account`={}", recruiterId);
                 if (resultCharacters)
                 {
                     do
                     {
-                        handler->PSendSysMessage(RECRUIT_FRIEND_NAMES, (*resultCharacters)[0].Get<std::string>());
+                        handler->PSendModuleSysMessage("mod-recruit-friend", RECRUIT_FRIEND_NAMES, (*resultCharacters)[0].Get<std::string>());
                     } while (resultCharacters->NextRow());
                 }
                 else
-                    ChatHandler(handler->GetSession()).SendSysMessage(RECRUIT_VIEW_EMPTY);
+                    handler->PSendModuleSysMessage("mod-recruit-friend", RECRUIT_VIEW_EMPTY);
             }
 
             return true;
@@ -260,13 +263,12 @@ public:
     void OnBeforeConfigLoad(bool reload) override
     {
         if (!reload)
-        {
             sConfigMgr->LoadModulesConfigs();
-            recruitFriend.announceEnable = sConfigMgr->GetOption<bool>("RecruitFriend.announceEnable", true);
-            recruitFriend.commandEnable = sConfigMgr->GetOption<bool>("RecruitFriend.enable", true);
-            recruitFriend.cooldownEnabled = sConfigMgr->GetOption<bool>("RecruitFriend.cooldownEnabled", true);
-            recruitFriend.cooldownValue = sConfigMgr->GetOption<uint32>("RecruitFriend.cooldownValue", 300000);
-        }
+
+        recruitFriend.announceEnable = sConfigMgr->GetOption<bool>("RecruitFriend.announceEnable", true);
+        recruitFriend.commandEnable = sConfigMgr->GetOption<bool>("RecruitFriend.enable", true);
+        recruitFriend.cooldownEnabled = sConfigMgr->GetOption<bool>("RecruitFriend.cooldownEnabled", true);
+        recruitFriend.cooldownValue = sConfigMgr->GetOption<uint32>("RecruitFriend.cooldownValue", 300000);
     }
 };
 

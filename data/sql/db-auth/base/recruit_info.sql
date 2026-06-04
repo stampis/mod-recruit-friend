@@ -1,0 +1,1 @@
+-- recruit_info table removed; logging is handled by RecruitFriend.log (see mod_recruit_friend.conf.dist)
